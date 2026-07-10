@@ -1,0 +1,22 @@
+# Scraper output
+data/
+captcha-debug/
+
+# CodeGraph local index/cache (rebuildable via `codegraph init`)
+.codegraph/
+
+# Captcha model (~95 MB) — fetched at runtime, not committed
+src/captcha/captcha.onnx
+*.onnx.part
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# uv
+# (uv.lock is committed on purpose)
+
+# OS
+.DS_Store
