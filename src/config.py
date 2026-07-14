@@ -73,6 +73,14 @@ THROTTLE_BACKOFF_BASE = 15.0
 # Filename (under the output dir) where records that came back empty are logged
 # so a later run can retry just those via --retry-failures.
 FAILURES_FILENAME = "failures.json"
+# After this many failed retries a failure entry is marked "stale": it stays in
+# failures.json for manual review but --retry-failures stops attempting it.
+STALE_RETRY_THRESHOLD = 5
+
+# --- S3 backend ----------------------------------------------------------------
+# Setting the S3_BUCKET env var switches storage to S3 (see storage.make_storage);
+# S3_PREFIX overrides this default key prefix.
+DEFAULT_S3_PREFIX = "sc-judgments/"
 
 # --- Paths -------------------------------------------------------------------
 DEFAULT_OUTPUT_DIR = Path("./data")

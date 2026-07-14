@@ -8,7 +8,7 @@ the English variant (lang_flg="") is fetched in this phase.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 from bs4 import BeautifulSoup
 
@@ -38,8 +38,15 @@ class Downloader:
             "lang_flg": "",  # English variant
         }
 
-    def download(self, record: JudgmentRecord) -> Optional[bytes]:
-        """Return English PDF bytes for a record, or None if unavailable."""
+    def download(self, record: JudgmentRecord) -> Tuple[Optional[bytes], Optional[str]]:
+        """Fetch the English PDF for a record.
+
+        Returns (pdf_bytes, None) on success, or (None, reason) on failure.
+        Reasons: "empty_pdf" (the portal's silent-throttle signal — the only
+        one the caller counts toward the throttle streak), "http_<status>"
+        (per-document HTTP error, e.g. 404), "no_outputfile" (portal gave no
+        file link, e.g. captcha exhausted).
+        """
         payload = self._pdf_payload(record)
         response = self.session.request(config.PDF_OPEN_CAPTCHA_URL, payload)
 
@@ -50,7 +57,7 @@ class Downloader:
         output_file = response.get("outputfile") if response else None
         if not output_file:
             logger.error("No outputfile for %s: %s", record.path, response)
-            return None
+            return None, "no_outputfile"
 
         return self._fetch_file(output_file)
 
@@ -72,16 +79,19 @@ class Downloader:
         logger.error("Exhausted PDF captcha retries")
         return {}
 
-    def _fetch_file(self, output_file: str) -> Optional[bytes]:
+    def _fetch_file(self, output_file: str) -> Tuple[Optional[bytes], Optional[str]]:
         resp = self.session.get(
             config.ROOT_URL + output_file,
             allow_redirects=True,
         )
+        if resp.status_code != 200:
+            logger.warning("HTTP %d fetching %s", resp.status_code, output_file)
+            return None, f"http_{resp.status_code}"
         content = resp.content
         if len(content) in _EMPTY_PDF_SIZES:
             logger.warning("Empty/placeholder PDF (%d bytes)", len(content))
-            return None
-        return content
+            return None, "empty_pdf"
+        return content, None
 
 
 def _needs_pdf_captcha(response: dict) -> bool:

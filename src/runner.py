@@ -4,25 +4,37 @@ Adds the throttle-survival behaviour learned from the portal:
   * downloads are paced + retried at the HTTP layer (see session.py);
   * a run of empty PDFs (the portal's silent throttle signal) triggers a
     bounded backoff and, if it persists, a clean abort with guidance;
-  * records that come back empty are logged to failures.json for later retry.
+  * records that fail are logged to failures.json for later retry.
+
+Three failure signals are kept distinguishable (they mean different things
+operationally and map to different exit codes in scrape.py):
+  * site down — connection errors / persistent 5xx while talking to the
+    portal (SessionError). The whole run is moot: Stats.site_down, exit 3.
+  * throttle — a streak of empty PDFs. Stats.aborted, exit 1 (existing).
+  * per-document — one record came back empty/404/without a file link.
+    Recorded in failures.json with a specific reason; the run continues.
+
+failures.json entries carry retry accounting: `first_seen`, `retry_count`
+(incremented by --retry-failures), and `status`. After
+config.STALE_RETRY_THRESHOLD failed retries an entry turns "stale": it stays
+in the file for manual review but is no longer auto-retried.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from . import config
 from .downloader import Downloader
 from .models import DateRangeTask, JudgmentRecord, generate_date_ranges
 from .search import search_judgments
-from .session import SCSession
-from .storage import Storage
+from .session import SCSession, SessionError
+from .storage import Storage, make_storage
 
 logger = logging.getLogger(__name__)
 
@@ -37,19 +49,22 @@ class Stats:
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
+    stale: int = 0
     aborted: bool = False
+    site_down: bool = False
     last_task: Optional[str] = None
     failures: List[dict] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
             f"found={self.found} downloaded={self.downloaded} "
-            f"skipped={self.skipped} failed={self.failed}"
+            f"skipped={self.skipped} failed={self.failed} stale={self.stale}"
         )
 
 
 def _failure_entry(record: JudgmentRecord, task: DateRangeTask, reason: str) -> dict:
     """Enough to reconstruct the record for a later --retry-failures run."""
+    now = datetime.now().isoformat()
     return {
         "path": record.path,
         "val": record.val,
@@ -59,15 +74,52 @@ def _failure_entry(record: JudgmentRecord, task: DateRangeTask, reason: str) -> 
         "search_from_date": task.from_date,
         "search_to_date": task.to_date,
         "reason": reason,
-        "failed_at": datetime.now().isoformat(),
+        "failed_at": now,
+        "first_seen": now,
+        "retry_count": 0,
+        "status": "active",
     }
 
 
-def _throttle_recovery(downloader: Downloader, record: JudgmentRecord, streak: int) -> Optional[bytes]:
+def _normalize_entry(entry: dict) -> dict:
+    """Backfill retry-accounting fields on entries written by older versions."""
+    entry.setdefault("first_seen", entry.get("failed_at", datetime.now().isoformat()))
+    entry.setdefault("retry_count", 0)
+    entry.setdefault("status", "active")
+    return entry
+
+
+def _merge_failures(
+    existing: List[dict], new_failures: List[dict], succeeded_paths: Set[str]
+) -> List[dict]:
+    """Fold this run's failures into the persisted file.
+
+    Entries the run didn't touch (other dates, stale ones) survive unchanged;
+    entries whose record was downloaded this run are dropped; a re-failure
+    keeps its original first_seen/retry_count/status.
+    """
+    merged = {
+        e["path"]: e for e in existing if e["path"] not in succeeded_paths
+    }
+    for entry in new_failures:
+        prev = merged.get(entry["path"])
+        if prev:
+            entry["first_seen"] = prev["first_seen"]
+            entry["retry_count"] = prev["retry_count"]
+            entry["status"] = prev["status"]
+        merged[entry["path"]] = entry
+    return list(merged.values())
+
+
+def _throttle_recovery(
+    downloader: Downloader, record: JudgmentRecord, streak: int
+) -> Tuple[Optional[bytes], Optional[str]]:
     """Bounded exponential backoff to ride out a possibly-transient empty streak.
 
-    Returns PDF bytes if a retry succeeds, else None (caller should abort).
+    Returns (pdf_bytes, None) if a retry succeeds, else (None, reason)
+    (caller should abort).
     """
+    reason: Optional[str] = "empty_pdf"
     for attempt in range(config.THROTTLE_RECOVERY_ATTEMPTS):
         wait = config.THROTTLE_BACKOFF_BASE * (2 ** attempt)
         logger.warning(
@@ -76,11 +128,11 @@ def _throttle_recovery(downloader: Downloader, record: JudgmentRecord, streak: i
             streak, wait, record.path, attempt + 1, config.THROTTLE_RECOVERY_ATTEMPTS,
         )
         time.sleep(wait)
-        pdf_bytes = downloader.download(record)
+        pdf_bytes, reason = downloader.download(record)
         if pdf_bytes:
             logger.info("Recovered after backoff; continuing")
-            return pdf_bytes
-    return None
+            return pdf_bytes, None
+    return None, reason
 
 
 def run_scrape(
@@ -90,15 +142,23 @@ def run_scrape(
     output_dir: Path,
     delay: Optional[float] = None,
 ) -> Stats:
-    """Scrape all judgments in [start_date, end_date] into output_dir."""
-    session = SCSession(delay=delay)
-    session.init()
-    storage = Storage(output_dir)
-    downloader = Downloader(session)
+    """Scrape all judgments in [start_date, end_date] into the storage backend."""
+    storage = make_storage(output_dir)
+    logger.info("Storage: %s", storage)
     stats = Stats()
 
+    session = SCSession(delay=delay)
+    try:
+        session.init()
+    except SessionError as exc:
+        stats.site_down = True
+        logger.error("Portal unreachable, could not establish a session: %s", exc)
+        return stats
+
+    downloader = Downloader(session)
     consecutive_empty = 0
     downloads_since_reset = 0
+    succeeded_paths: Set[str] = set()
 
     try:
         for task in generate_date_ranges(start_date, end_date, day_step):
@@ -109,6 +169,7 @@ def run_scrape(
 
                 if storage.already_downloaded(record):
                     stats.skipped += 1
+                    succeeded_paths.add(record.path)
                     logger.debug("Skip (exists): %s", record.path)
                     continue
 
@@ -119,7 +180,9 @@ def run_scrape(
                     downloads_since_reset = 0
 
                 try:
-                    pdf_bytes = downloader.download(record)
+                    pdf_bytes, reason = downloader.download(record)
+                except SessionError:
+                    raise  # portal-level failure, not a per-record one
                 except Exception as exc:  # a single bad row shouldn't kill the run
                     logger.error("Error downloading %s: %s", record.path, exc)
                     stats.failed += 1
@@ -128,20 +191,32 @@ def run_scrape(
 
                 # Empty PDF: the portal's silent throttle signal. Once we've seen
                 # a streak, try a bounded backoff before giving up on the record.
-                if pdf_bytes is None and consecutive_empty + 1 >= config.CONSECUTIVE_EMPTY_THRESHOLD:
-                    pdf_bytes = _throttle_recovery(downloader, record, consecutive_empty + 1)
+                is_throttle_signal = reason == "empty_pdf"
+                if (
+                    is_throttle_signal
+                    and consecutive_empty + 1 >= config.CONSECUTIVE_EMPTY_THRESHOLD
+                ):
+                    pdf_bytes, reason = _throttle_recovery(
+                        downloader, record, consecutive_empty + 1
+                    )
+                    is_throttle_signal = reason == "empty_pdf"
 
                 if pdf_bytes:
                     storage.save(record, pdf_bytes, task)
                     stats.downloaded += 1
                     downloads_since_reset += 1
+                    succeeded_paths.add(record.path)
                     consecutive_empty = 0
                 else:
                     stats.failed += 1
-                    stats.failures.append(_failure_entry(record, task, "empty_pdf"))
-                    consecutive_empty += 1
-                    if consecutive_empty >= config.CONSECUTIVE_EMPTY_THRESHOLD:
-                        raise ThrottleError(consecutive_empty)
+                    stats.failures.append(_failure_entry(record, task, reason or "unknown"))
+                    if is_throttle_signal:
+                        consecutive_empty += 1
+                        if consecutive_empty >= config.CONSECUTIVE_EMPTY_THRESHOLD:
+                            raise ThrottleError(consecutive_empty)
+                    else:
+                        # A 404 etc. is this document's problem, not throttling.
+                        consecutive_empty = 0
 
     except ThrottleError as exc:
         stats.aborted = True
@@ -150,35 +225,78 @@ def run_scrape(
             "almost certainly throttling this IP.",
             exc,
         )
+    except SessionError as exc:
+        stats.site_down = True
+        logger.error("Portal unreachable mid-run (connection/5xx): %s", exc)
     finally:
-        _write_failures(output_dir, stats.failures)
+        existing = [_normalize_entry(e) for e in storage.load_failures()]
+        storage.save_failures(
+            _merge_failures(existing, stats.failures, succeeded_paths)
+        )
 
-    _log_outcome(stats, output_dir)
+    _log_outcome(stats, storage)
     return stats
 
 
 def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
-    """Re-attempt only the records recorded in failures.json."""
-    failures_path = Path(output_dir) / config.FAILURES_FILENAME
-    if not failures_path.exists():
-        logger.info("No failures file at %s; nothing to retry", failures_path)
-        return Stats()
+    """Re-attempt the active records recorded in failures.json.
 
-    entries = json.loads(failures_path.read_text())
-    logger.info("Retrying %d failed record(s)", len(entries))
-
-    session = SCSession(delay=delay)
-    session.init()
-    storage = Storage(output_dir)
-    downloader = Downloader(session)
+    Each still-failing entry has its retry_count incremented; entries reaching
+    config.STALE_RETRY_THRESHOLD are marked stale and skipped by future runs.
+    """
+    storage = make_storage(output_dir)
+    logger.info("Storage: %s", storage)
     stats = Stats()
 
+    entries = [_normalize_entry(e) for e in storage.load_failures()]
+    if not entries:
+        logger.info("No failures recorded; nothing to retry")
+        return stats
+
+    stale = [e for e in entries if e["status"] == "stale"]
+    active = [e for e in entries if e["status"] != "stale"]
+    stats.stale = len(stale)
+    if stale:
+        logger.warning(
+            "%d stale record(s) (>=%d failed retries) need manual review: %s",
+            len(stale), config.STALE_RETRY_THRESHOLD,
+            ", ".join(e["path"] for e in stale),
+        )
+    if not active:
+        logger.info("No active failures to retry")
+        return stats
+    logger.info("Retrying %d failed record(s)", len(active))
+
+    session = SCSession(delay=delay)
+    try:
+        session.init()
+    except SessionError as exc:
+        stats.site_down = True
+        logger.error("Portal unreachable, could not establish a session: %s", exc)
+        return stats  # leave failures.json untouched
+
+    downloader = Downloader(session)
     consecutive_empty = 0
     downloads_since_reset = 0
     still_failing: List[dict] = []
+    succeeded_paths: Set[str] = set()
+
+    def _record_failure(entry: dict, reason: Optional[str]) -> None:
+        entry["retry_count"] += 1
+        entry["failed_at"] = datetime.now().isoformat()
+        if reason:
+            entry["reason"] = reason
+        if entry["retry_count"] >= config.STALE_RETRY_THRESHOLD:
+            entry["status"] = "stale"
+            stats.stale += 1
+            logger.warning(
+                "Marking %s stale after %d failed retries — manual review needed",
+                entry["path"], entry["retry_count"],
+            )
+        still_failing.append(entry)
 
     try:
-        for entry in entries:
+        for index, entry in enumerate(active):
             record = JudgmentRecord(
                 path=entry["path"],
                 val=entry["val"],
@@ -192,56 +310,72 @@ def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
 
             if storage.already_downloaded(record):
                 stats.skipped += 1
+                succeeded_paths.add(record.path)
                 continue
 
             if downloads_since_reset >= config.NO_CAPTCHA_BATCH_SIZE:
                 session.init()
                 downloads_since_reset = 0
 
-            pdf_bytes = downloader.download(record)
-            if pdf_bytes is None and consecutive_empty + 1 >= config.CONSECUTIVE_EMPTY_THRESHOLD:
-                pdf_bytes = _throttle_recovery(downloader, record, consecutive_empty + 1)
+            pdf_bytes, reason = downloader.download(record)
+            is_throttle_signal = reason == "empty_pdf"
+            if (
+                is_throttle_signal
+                and consecutive_empty + 1 >= config.CONSECUTIVE_EMPTY_THRESHOLD
+            ):
+                pdf_bytes, reason = _throttle_recovery(
+                    downloader, record, consecutive_empty + 1
+                )
+                is_throttle_signal = reason == "empty_pdf"
 
             if pdf_bytes:
                 storage.save(record, pdf_bytes, task)
                 stats.downloaded += 1
                 downloads_since_reset += 1
+                succeeded_paths.add(record.path)
                 consecutive_empty = 0
             else:
                 stats.failed += 1
-                still_failing.append(entry)
-                consecutive_empty += 1
-                if consecutive_empty >= config.CONSECUTIVE_EMPTY_THRESHOLD:
-                    # Keep the records we haven't reached yet in the file too.
-                    still_failing.extend(entries[entries.index(entry) + 1:])
-                    raise ThrottleError(consecutive_empty)
+                _record_failure(entry, reason)
+                if is_throttle_signal:
+                    consecutive_empty += 1
+                    if consecutive_empty >= config.CONSECUTIVE_EMPTY_THRESHOLD:
+                        # Keep the records we haven't reached yet in the file
+                        # too, untouched (they weren't attempted).
+                        still_failing.extend(active[index + 1:])
+                        raise ThrottleError(consecutive_empty)
+                else:
+                    consecutive_empty = 0
     except ThrottleError as exc:
         stats.aborted = True
         logger.error("Aborting retry: %s empty PDFs in a row — still throttled.", exc)
+    except SessionError as exc:
+        stats.site_down = True
+        logger.error("Portal unreachable mid-run (connection/5xx): %s", exc)
     finally:
-        _write_failures(output_dir, still_failing)
+        if stats.site_down:
+            # A dead portal says nothing about individual records: put every
+            # unresolved entry back unchanged (no retry_count increment).
+            handled = {e["path"] for e in still_failing} | succeeded_paths
+            still_failing.extend(e for e in active if e["path"] not in handled)
+        storage.save_failures(stale + still_failing)
 
-    _log_outcome(stats, output_dir)
+    _log_outcome(stats, storage)
     return stats
 
 
-def _write_failures(output_dir: Path, failures: List[dict]) -> None:
-    path = Path(output_dir) / config.FAILURES_FILENAME
-    if failures:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(failures, indent=2))
-        logger.info("Wrote %d failure record(s) to %s", len(failures), path)
-    elif path.exists():
-        # Nothing failed this run: clear a stale failures file.
-        path.unlink()
-
-
-def _log_outcome(stats: Stats, output_dir: Path) -> None:
+def _log_outcome(stats: Stats, storage: Storage) -> None:
     logger.info("Done: %s", stats.summary())
-    if stats.aborted:
+    if stats.site_down:
+        logger.warning(
+            "Portal appears DOWN (connection errors / persistent 5xx). Nothing "
+            "to do but wait; already-recorded failures are preserved for the "
+            "next --retry-failures run."
+        )
+    elif stats.aborted:
         logger.warning(
             "Run aborted at task %s. Saved PDFs are in %s. Wait for the throttle "
             "to lift (try again later or from another network), then re-run the "
             "same command to resume, or use --retry-failures to target the misses.",
-            stats.last_task, output_dir,
+            stats.last_task, storage,
         )

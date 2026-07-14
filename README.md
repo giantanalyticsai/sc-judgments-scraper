@@ -104,9 +104,17 @@ around that:
 - **Throttle detection**: after `CONSECUTIVE_EMPTY_THRESHOLD` empty PDFs in a
   row, the scraper backs off; if empties persist it **aborts with guidance**
   rather than hammering the server.
-- **Failed-record tracking**: records that came back empty are written to
-  `<output-dir>/failures.json`. After the throttle lifts, run
-  `--retry-failures` to re-attempt just those without re-walking the range.
+- **Failed-record tracking**: records that fail are written to
+  `<output-dir>/failures.json` with a specific `reason` (`empty_pdf`,
+  `http_<status>`, `no_outputfile`, `error: ...`). After the throttle lifts,
+  run `--retry-failures` to re-attempt just those without re-walking the range.
+- **Retry accounting**: each failure entry carries `first_seen`, `retry_count`
+  (incremented by `--retry-failures`), and `status`. After
+  `STALE_RETRY_THRESHOLD` (default 5) failed retries an entry turns `stale`:
+  it stays in `failures.json` for manual review but is no longer auto-retried.
+- **Failure signals are distinguishable by exit code**: `0` success, `1`
+  throttle abort (streak of empty PDFs), `2` usage error, `3` portal down
+  (connection errors / persistent 5xx — nothing document-specific happened).
 
 If a run aborts as throttled: wait for the limit to reset (try later, or from a
 different network), then re-run the same command (already-downloaded PDFs are
@@ -123,6 +131,20 @@ data/
 
 Re-running the same range skips judgments whose PDFs already exist, so runs are
 resumable.
+
+### S3 backend
+
+Set `S3_BUCKET` (and optionally `S3_PREFIX`, default `sc-judgments/`) to write
+the same layout — including `failures.json` — to S3 instead of local disk;
+this is what makes scheduled runs on ECS Fargate durable across ephemeral
+containers. Skip-existing checks then consult S3 (`HeadObject`). Credentials
+come from boto3's default chain (task role on Fargate, `AWS_PROFILE`/SSO
+locally) — never set static keys.
+
+```sh
+S3_BUCKET=sc-judgments-scraper-dev S3_PREFIX=judgments/ \
+    uv run python scrape.py --daily --offset 1
+```
 
 ## How it works
 

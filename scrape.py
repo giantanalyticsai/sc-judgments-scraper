@@ -87,6 +87,11 @@ def main(argv=None) -> int:
         )
 
     print(f"\nSummary: {stats.summary()}")
+    # Exit codes: 0 ok, 1 throttle abort, 2 usage error, 3 portal down.
+    if stats.site_down:
+        print("Portal appears down (connection errors / persistent 5xx) — "
+              "see the warning above.")
+        return 3
     if stats.aborted:
         print("Run was aborted early (likely throttled) — see the warning above.")
         return 1
