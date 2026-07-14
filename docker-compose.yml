@@ -1,0 +1,41 @@
+# Local Docker orchestration for the SC judgments scraper.
+#
+# Two services share the same image and the same ./data volume:
+#
+#   scraper    – on-demand runs. Args go straight to scrape.py, e.g.:
+#                  docker compose run --rm scraper --daily
+#                  docker compose run --rm scraper --start-date 2024-01-02 --end-date 2024-01-03
+#                  docker compose run --rm scraper --retry-failures
+#
+#   scheduler  – a long-running container that fires a daily scrape at RUN_AT
+#                (local wall-clock time in TZ). Start it with:
+#                  docker compose up scheduler
+#                For a live demo, set RUN_AT a couple of minutes ahead (below),
+#                or set RUN_ON_START=true to run once immediately on startup.
+
+services:
+  scraper:
+    build: .
+    image: sc-scraper
+    volumes:
+      - ./data:/app/data
+    # No command here: pass scrape.py args on the CLI via `docker compose run`.
+    # The image's entrypoint makes ./data writable and drops to a non-root user
+    # automatically, so this works no matter who owns ./data on the host.
+
+  scheduler:
+    build: .
+    image: sc-scraper
+    # Reuse the portable entrypoint (writable data dir + drop to non-root),
+    # then run the scheduler loop instead of a one-shot scrape.
+    entrypoint: ["docker-entrypoint.sh", "sh", "/app/schedule.sh"]
+    environment:
+      # --- change these for a demo ---
+      RUN_AT: "10:58"          # trigger time, "HH:MM" (24h) in TZ below
+      TZ: "Asia/Kolkata"       # so RUN_AT matches the clock you're watching
+      OFFSET: "0"              # 0 = scrape today, 1 = yesterday
+      RUN_ON_START: "false"    # set "true" to also run once immediately on start
+      # SCRAPE_ARGS: "--delay 2"  # optional extra args for scrape.py
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

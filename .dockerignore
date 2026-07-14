@@ -1,0 +1,27 @@
+# Keep the build context small and reproducible.
+
+# Scraper output (mounted as a volume at runtime, never baked in)
+data/
+captcha-debug/
+
+# The captcha model is fetched during the build; don't ship any local copy
+src/captcha/captcha.onnx
+*.onnx.part
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# VCS & tooling
+.git/
+.gitignore
+.codegraph/
+
+# Docs / local artefacts not needed in the image
+*.md
+Scraper_Docker_Plan.md
+
+# OS
+.DS_Store

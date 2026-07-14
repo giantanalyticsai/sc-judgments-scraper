@@ -25,10 +25,56 @@ in a Docker build so the image ships with it cached):
 uv run python fetch_model.py
 ```
 
+## Docker (local)
+
+Run everything in a container — no local Python/uv setup needed. The image bakes
+the captcha model in at build time, and output is written to a mounted `./data`
+directory on your host.
+
+```bash
+# Build once (the model is fetched during the build)
+docker build -t sc-scraper .
+
+# On-demand run — args after the image go straight to scrape.py
+docker run --rm -v "$PWD/data:/app/data" \
+  sc-scraper --start-date 2024-01-02 --end-date 2024-01-03
+```
+
+Or via Compose:
+
+```bash
+docker compose run --rm scraper --daily          # scrape today
+docker compose run --rm scraper --retry-failures # retry prior misses
+```
+
+### Daily schedule (local, no cron/cloud)
+
+The `scheduler` service runs a daily scrape at a wall-clock time you set. It's
+built for demos: set the trigger a couple of minutes ahead and watch it fire.
+
+```bash
+docker compose up scheduler
+```
+
+Configure it in `docker-compose.yml` (or via env):
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `RUN_AT` | `23:30` | Daily trigger time, `HH:MM` (24h), in `TZ` |
+| `TZ` | `Asia/Kolkata` | Timezone `RUN_AT` and "today" are interpreted in |
+| `OFFSET` | `0` | Days before today to scrape (`1` = yesterday) |
+| `RUN_ON_START` | `false` | Also run once immediately on startup (demo escape hatch) |
+| `SCRAPE_ARGS` | — | Extra args appended to `scrape.py --daily` |
+
+**Demo tip:** set `RUN_AT` to ~2 minutes ahead, `docker compose up scheduler`,
+and follow the logs — you'll see the "triggering daily scrape" line fire on cue.
+
 ## Usage
 
 ```bash
 uv run python scrape.py --start-date 2024-01-02 --end-date 2024-01-03
+uv run python scrape.py --daily            # scrape today (local time)
+uv run python scrape.py --daily --offset 1 # scrape yesterday
 ```
 
 Options:

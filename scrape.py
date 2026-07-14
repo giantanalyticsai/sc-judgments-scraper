@@ -3,6 +3,8 @@
 
 Usage:
     uv run python scrape.py --start-date 2024-01-02 --end-date 2024-01-03
+    uv run python scrape.py --daily                     # scrape today (local time)
+    uv run python scrape.py --daily --offset 1          # scrape yesterday
     uv run python scrape.py --retry-failures            # retry only prior misses
 """
 
@@ -11,7 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from src import config
@@ -32,6 +34,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Start date (inclusive), YYYY-MM-DD")
     parser.add_argument("--end-date", type=_valid_date,
                         help="End date (inclusive), YYYY-MM-DD")
+    parser.add_argument("--daily", action="store_true",
+                        help="Scrape a single day (today by default), overriding "
+                             "--start-date/--end-date. Uses the container/host local "
+                             "time, so set TZ to control which day 'today' means.")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="With --daily, how many days before today to scrape "
+                             "(0 = today, 1 = yesterday). Default: 0")
     parser.add_argument("--day-step", type=int, default=30,
                         help="Days per search chunk (default: 30)")
     parser.add_argument("--output-dir", type=Path, default=config.DEFAULT_OUTPUT_DIR,
@@ -53,6 +62,11 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if args.daily:
+        day = (datetime.now() - timedelta(days=args.offset)).strftime("%Y-%m-%d")
+        args.start_date = args.end_date = day
+        logging.getLogger(__name__).info("Daily mode: scraping %s", day)
 
     if args.retry_failures:
         stats = retry_failures(output_dir=args.output_dir, delay=args.delay)
