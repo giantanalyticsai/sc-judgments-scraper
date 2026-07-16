@@ -93,32 +93,42 @@ Options:
 
 ## Throttling & resilience
 
-The portal throttles by request volume and fails **silently** — it returns
-HTTP 200 with a **0-byte PDF body** rather than an error. The scraper is built
-around that:
+The portal throttles by **download volume per source IP** (~25 PDFs) and fails
+**silently** — it returns HTTP 200 with a **0-byte PDF body** rather than an
+error. Because the limit is volume-per-IP rather than a rate, raising `--delay`
+alone does **not** avoid it. The scraper is built around that:
 
 - **Pacing**: every request waits `--delay` seconds (plus jitter) to stay under
   the limit.
 - **Transient retries**: network drops, SSL errors, timeouts, and 5xx responses
   are retried with exponential backoff (`session.py`).
-- **Throttle detection**: after `CONSECUTIVE_EMPTY_THRESHOLD` empty PDFs in a
-  row, the scraper backs off; if empties persist it **aborts with guidance**
-  rather than hammering the server.
+- **Throttle ride-out**: after `CONSECUTIVE_EMPTY_THRESHOLD` empty PDFs in a row
+  the scraper treats it as throttling and **rides it out** — it cools down
+  (`THROTTLE_COOLDOWN_BASE`, escalating up to `THROTTLE_COOLDOWN_MAX`), refreshes
+  the session, and resumes, repeating up to `MAX_THROTTLE_COOLDOWNS` times. Since
+  the per-IP window resets within minutes, a single run self-paces through the
+  whole range in ~25-download installments with cooldowns between them — no more
+  manual re-runs. It **aborts with guidance only if the throttle never lifts**
+  after all cooldowns (i.e. a hard block, not pacing).
 - **Failed-record tracking**: records that fail are written to
   `<output-dir>/failures.json` with a specific `reason` (`empty_pdf`,
   `http_<status>`, `no_outputfile`, `error: ...`). After the throttle lifts,
   run `--retry-failures` to re-attempt just those without re-walking the range.
 - **Retry accounting**: each failure entry carries `first_seen`, `retry_count`
-  (incremented by `--retry-failures`), and `status`. After
-  `STALE_RETRY_THRESHOLD` (default 5) failed retries an entry turns `stale`:
-  it stays in `failures.json` for manual review but is no longer auto-retried.
+  (incremented by `--retry-failures` **on genuine failures only** — throttle
+  empties are ridden out and never counted), and `status`. After
+  `STALE_RETRY_THRESHOLD` (default 5) genuine failed retries an entry turns
+  `stale`: it stays in `failures.json` for manual review but is no longer
+  auto-retried. Because throttle empties never age an entry, a
+  throttled-but-downloadable judgment is never silently stranded.
 - **Failure signals are distinguishable by exit code**: `0` success, `1`
-  throttle abort (streak of empty PDFs), `2` usage error, `3` portal down
-  (connection errors / persistent 5xx — nothing document-specific happened).
+  throttle abort (throttle never lifted after all cooldowns), `2` usage error,
+  `3` portal down (connection errors / persistent 5xx — nothing
+  document-specific happened).
 
-If a run aborts as throttled: wait for the limit to reset (try later, or from a
-different network), then re-run the same command (already-downloaded PDFs are
-skipped) or use `--retry-failures`.
+If a run still aborts as throttled (a hard block): wait for the limit to reset
+(try later, or from a different network), then re-run the same command
+(already-downloaded PDFs are skipped) or use `--retry-failures`.
 
 ## Output layout
 

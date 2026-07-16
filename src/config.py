@@ -62,19 +62,30 @@ REQUEST_DELAY_JITTER = 0.75
 MAX_HTTP_RETRIES = 4
 HTTP_BACKOFF_BASE = 2.0
 
-# --- Throttle detection ------------------------------------------------------
-# The portal signals throttling silently: HTTP 200 with a 0-byte PDF body. When
-# this many empty PDFs arrive back-to-back we suspect throttling, do a bounded
-# backoff to ride out a transient blip, then abort the run if it persists.
+# --- Throttle detection & ride-out -------------------------------------------
+# The portal signals throttling silently: HTTP 200 with a 0-byte PDF body, and
+# it throttles by VOLUME per source IP (~25 downloads), not by rate — so pacing
+# (REQUEST_DELAY) alone cannot avoid it. When this many empty PDFs arrive
+# back-to-back we treat it as throttling.
 CONSECUTIVE_EMPTY_THRESHOLD = 5
-THROTTLE_RECOVERY_ATTEMPTS = 2
-THROTTLE_BACKOFF_BASE = 15.0
+# Rather than abort on a throttle, ride it out: the per-IP window resets within
+# minutes, so cool down (escalating, capped), refresh the session, and resume.
+# The escalation restarts from the base each time a record recovers, so steady-
+# state is a flat ~THROTTLE_COOLDOWN_BASE wait between ~25-download installments.
+THROTTLE_COOLDOWN_BASE = 120.0       # first cooldown, seconds
+THROTTLE_COOLDOWN_MAX = 900.0        # cap a single cooldown at 15 min
+# Give up (abort, exit 1) only after this many consecutive cooldowns fail to
+# lift the throttle — by then it is almost certainly a hard block, not pacing.
+MAX_THROTTLE_COOLDOWNS = 20
 
 # Filename (under the output dir) where records that came back empty are logged
 # so a later run can retry just those via --retry-failures.
 FAILURES_FILENAME = "failures.json"
-# After this many failed retries a failure entry is marked "stale": it stays in
-# failures.json for manual review but --retry-failures stops attempting it.
+# After this many GENUINE failed retries (404 / no-file / errors — NOT throttle
+# empties, which are ridden out above) a failure entry is marked "stale": it
+# stays in failures.json for manual review but --retry-failures stops attempting
+# it. Throttle empties never count toward this, so a throttled-but-downloadable
+# judgment is never silently stranded.
 STALE_RETRY_THRESHOLD = 5
 
 # --- S3 backend ----------------------------------------------------------------

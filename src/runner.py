@@ -2,8 +2,10 @@
 
 Adds the throttle-survival behaviour learned from the portal:
   * downloads are paced + retried at the HTTP layer (see session.py);
-  * a run of empty PDFs (the portal's silent throttle signal) triggers a
-    bounded backoff and, if it persists, a clean abort with guidance;
+  * a run of empty PDFs (the portal's silent, per-IP throttle signal) is ridden
+    out — cool down, refresh the session, resume — rather than aborting, since
+    the per-IP window resets within minutes. Only if the throttle never lifts
+    after config.MAX_THROTTLE_COOLDOWNS does the run abort with guidance;
   * records that fail are logged to failures.json for later retry.
 
 Three failure signals are kept distinguishable (they mean different things
@@ -15,9 +17,10 @@ operationally and map to different exit codes in scrape.py):
     Recorded in failures.json with a specific reason; the run continues.
 
 failures.json entries carry retry accounting: `first_seen`, `retry_count`
-(incremented by --retry-failures), and `status`. After
-config.STALE_RETRY_THRESHOLD failed retries an entry turns "stale": it stays
-in the file for manual review but is no longer auto-retried.
+(incremented by --retry-failures on GENUINE failures only, never on ridden-out
+throttle empties), and `status`. After config.STALE_RETRY_THRESHOLD genuine
+failed retries an entry turns "stale": it stays in the file for manual review
+but is no longer auto-retried.
 """
 
 from __future__ import annotations
@@ -111,27 +114,46 @@ def _merge_failures(
     return list(merged.values())
 
 
-def _throttle_recovery(
-    downloader: Downloader, record: JudgmentRecord, streak: int
+def _ride_out_throttle(
+    session: SCSession, downloader: Downloader, record: JudgmentRecord, streak: int
 ) -> Tuple[Optional[bytes], Optional[str]]:
-    """Bounded exponential backoff to ride out a possibly-transient empty streak.
+    """Ride out portal throttling instead of aborting.
 
-    Returns (pdf_bytes, None) if a retry succeeds, else (None, reason)
-    (caller should abort).
+    A sustained streak of empty PDFs means the portal is throttling this IP by
+    volume. The per-IP window resets within minutes, so cool down (escalating up
+    to THROTTLE_COOLDOWN_MAX), refresh the session, and re-attempt the record —
+    up to config.MAX_THROTTLE_COOLDOWNS times. The session is refreshed on each
+    cooldown, so the caller should reset its no-captcha download counter.
+
+    Returns the first non-throttle outcome: (pdf_bytes, None) on success, or
+    (None, reason) for a genuine per-document failure. If every cooldown still
+    comes back empty, returns (None, "empty_pdf") and the caller aborts.
+    Propagates SessionError if the portal is unreachable during a refresh.
     """
+    pdf_bytes: Optional[bytes] = None
     reason: Optional[str] = "empty_pdf"
-    for attempt in range(config.THROTTLE_RECOVERY_ATTEMPTS):
-        wait = config.THROTTLE_BACKOFF_BASE * (2 ** attempt)
+    for cooldown in range(config.MAX_THROTTLE_COOLDOWNS):
+        wait = min(
+            config.THROTTLE_COOLDOWN_BASE * (2 ** cooldown), config.THROTTLE_COOLDOWN_MAX
+        )
         logger.warning(
-            "Suspected throttling (%d empty PDFs in a row). Backing off %.0fs, "
-            "then retrying %s [%d/%d]",
-            streak, wait, record.path, attempt + 1, config.THROTTLE_RECOVERY_ATTEMPTS,
+            "Suspected throttling (%d empty PDFs in a row). Cooling down %.0fs, "
+            "then refreshing the session and retrying %s [ride-out %d/%d]",
+            streak, wait, record.path, cooldown + 1, config.MAX_THROTTLE_COOLDOWNS,
         )
         time.sleep(wait)
+        session.init()  # fresh session/IP window; SessionError -> site_down
         pdf_bytes, reason = downloader.download(record)
         if pdf_bytes:
-            logger.info("Recovered after backoff; continuing")
+            logger.info("Throttle lifted after cooldown; resuming")
             return pdf_bytes, None
+        if reason != "empty_pdf":
+            # A genuine per-document failure (404 / no file), not throttling.
+            return None, reason
+    logger.error(
+        "Throttle did not lift after %d cooldowns; treating as a hard block",
+        config.MAX_THROTTLE_COOLDOWNS,
+    )
     return None, reason
 
 
@@ -189,16 +211,18 @@ def run_scrape(
                     stats.failures.append(_failure_entry(record, task, f"error: {exc}"))
                     continue
 
-                # Empty PDF: the portal's silent throttle signal. Once we've seen
-                # a streak, try a bounded backoff before giving up on the record.
+                # Empty PDF: the portal's silent, per-IP throttle signal. Once
+                # we've seen a streak, ride it out (cool down + refresh session +
+                # retry) rather than giving up — the window resets in minutes.
                 is_throttle_signal = reason == "empty_pdf"
                 if (
                     is_throttle_signal
                     and consecutive_empty + 1 >= config.CONSECUTIVE_EMPTY_THRESHOLD
                 ):
-                    pdf_bytes, reason = _throttle_recovery(
-                        downloader, record, consecutive_empty + 1
+                    pdf_bytes, reason = _ride_out_throttle(
+                        session, downloader, record, consecutive_empty + 1
                     )
+                    downloads_since_reset = 0  # session was refreshed inside
                     is_throttle_signal = reason == "empty_pdf"
 
                 if pdf_bytes:
@@ -221,9 +245,9 @@ def run_scrape(
     except ThrottleError as exc:
         stats.aborted = True
         logger.error(
-            "Aborting: %s empty PDFs in a row after backoff — the portal is "
-            "almost certainly throttling this IP.",
-            exc,
+            "Aborting: still %s empty PDFs in a row after %d throttle cooldowns — "
+            "the portal is hard-blocking this IP, not just pacing.",
+            exc, config.MAX_THROTTLE_COOLDOWNS,
         )
     except SessionError as exc:
         stats.site_down = True
@@ -282,17 +306,23 @@ def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
     succeeded_paths: Set[str] = set()
 
     def _record_failure(entry: dict, reason: Optional[str]) -> None:
-        entry["retry_count"] += 1
         entry["failed_at"] = datetime.now().isoformat()
         if reason:
             entry["reason"] = reason
-        if entry["retry_count"] >= config.STALE_RETRY_THRESHOLD:
-            entry["status"] = "stale"
-            stats.stale += 1
-            logger.warning(
-                "Marking %s stale after %d failed retries — manual review needed",
-                entry["path"], entry["retry_count"],
-            )
+        # Throttle empties are the portal's problem, not the document's: they are
+        # ridden out above, and any that still land here must NOT count toward the
+        # stale threshold — otherwise a throttled-but-downloadable judgment would
+        # be stranded (marked stale and skipped forever). Only genuine per-record
+        # failures (404 / no-file / errors) age an entry toward stale.
+        if reason != "empty_pdf":
+            entry["retry_count"] += 1
+            if entry["retry_count"] >= config.STALE_RETRY_THRESHOLD:
+                entry["status"] = "stale"
+                stats.stale += 1
+                logger.warning(
+                    "Marking %s stale after %d failed retries — manual review needed",
+                    entry["path"], entry["retry_count"],
+                )
         still_failing.append(entry)
 
     try:
@@ -323,9 +353,10 @@ def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
                 is_throttle_signal
                 and consecutive_empty + 1 >= config.CONSECUTIVE_EMPTY_THRESHOLD
             ):
-                pdf_bytes, reason = _throttle_recovery(
-                    downloader, record, consecutive_empty + 1
+                pdf_bytes, reason = _ride_out_throttle(
+                    session, downloader, record, consecutive_empty + 1
                 )
+                downloads_since_reset = 0  # session was refreshed inside
                 is_throttle_signal = reason == "empty_pdf"
 
             if pdf_bytes:
@@ -348,7 +379,11 @@ def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
                     consecutive_empty = 0
     except ThrottleError as exc:
         stats.aborted = True
-        logger.error("Aborting retry: %s empty PDFs in a row — still throttled.", exc)
+        logger.error(
+            "Aborting retry: still %s empty PDFs after %d throttle cooldowns — "
+            "portal hard-blocking this IP.",
+            exc, config.MAX_THROTTLE_COOLDOWNS,
+        )
     except SessionError as exc:
         stats.site_down = True
         logger.error("Portal unreachable mid-run (connection/5xx): %s", exc)
@@ -374,8 +409,9 @@ def _log_outcome(stats: Stats, storage: Storage) -> None:
         )
     elif stats.aborted:
         logger.warning(
-            "Run aborted at task %s. Saved PDFs are in %s. Wait for the throttle "
-            "to lift (try again later or from another network), then re-run the "
-            "same command to resume, or use --retry-failures to target the misses.",
-            stats.last_task, storage,
+            "Run aborted at task %s: the throttle did not lift after %d cooldowns, "
+            "so the portal is likely hard-blocking this IP. Saved PDFs are in %s. "
+            "Try again later or from another network, then re-run the same command "
+            "to resume, or use --retry-failures to target the misses.",
+            stats.last_task, config.MAX_THROTTLE_COOLDOWNS, storage,
         )
