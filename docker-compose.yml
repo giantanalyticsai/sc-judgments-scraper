@@ -20,14 +20,15 @@ services:
     volumes:
       - ./data:/app/data
     # No command here: pass scrape.py args on the CLI via `docker compose run`.
-    # The image's entrypoint makes ./data writable and drops to a non-root user
-    # automatically, so this works no matter who owns ./data on the host.
+    # The image runs as an unprivileged user (UID 1000) and never as root, so
+    # the bind-mounted ./data must be writable by UID 1000 on the host (or use
+    # the S3 backend via S3_BUCKET/S3_PREFIX).
 
   scheduler:
     build: .
     image: sc-scraper
-    # Reuse the portable entrypoint (writable data dir + drop to non-root),
-    # then run the scheduler loop instead of a one-shot scrape.
+    # Reuse the entrypoint (ensures the data dir exists), then run the scheduler
+    # loop instead of a one-shot scrape. Runs unprivileged, same as scraper.
     entrypoint: ["docker-entrypoint.sh", "sh", "/app/schedule.sh"]
     environment:
       # --- change these for a demo ---

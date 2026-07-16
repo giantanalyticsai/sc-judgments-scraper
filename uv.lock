@@ -996,7 +996,7 @@ wheels = [
 
 [[package]]
 name = "sc-judgments-scraper"
-version = "0.3.0"
+version = "0.3.1"
 source = { virtual = "." }
 dependencies = [
     { name = "beautifulsoup4" },

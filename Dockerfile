@@ -3,7 +3,8 @@
 # Local Docker image for the SC judgments scraper.
 # Multi-stage: the builder resolves deps with uv and bakes the ~95 MB captcha
 # ONNX model into the image so a run needs no GitHub access. The runtime stage
-# is a slim, non-root image containing just the venv, source, and model.
+# is a slim image that runs as an unprivileged user (UID 1000) from PID 1 —
+# never root — containing just the venv, source, and model.
 #
 # Build:  docker build -t sc-scraper .
 # Run:    docker run --rm -v "$PWD/data:/app/data" \
@@ -33,35 +34,37 @@ FROM python:3.12-slim AS runtime
 WORKDIR /app
 
 # tzdata so TZ (e.g. Asia/Kolkata) is honoured by both Python and `date`,
-# which the scheduler relies on for the trigger time and "today".
-# gosu lets the entrypoint drop from root to an unprivileged user cleanly
-# (proper signal/TTY handling, unlike su/sudo).
+# which decide which day "today"/"yesterday" means. No gosu / privilege-drop
+# tooling: the container runs unprivileged from PID 1 (see USER below), so it
+# is never root at any point.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata gosu \
+    && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/runner
 
 # Bring over the built venv, source, and baked-in model.
 COPY --from=builder /app /app
 
-# Create the unprivileged runtime user and give it the app + data dir. The
-# container still STARTS as root so the entrypoint can make a freshly-mounted
-# data volume writable (see docker-entrypoint.sh); it drops to `runner` via
-# gosu before running any application code. This is what makes the image
-# portable across a laptop bind mount, ECS, or any other host.
+# Create the unprivileged runtime user, own the app (venv + source + baked
+# model + data dir), then switch to it. The image NEVER runs as root: PID 1 is
+# already UID 1000, so a compromise can't start from root. On Fargate output
+# goes to S3 (no local writes); for a local bind mount the operator must make
+# ./data writable by UID 1000 (the container can no longer chown it, by design).
 RUN useradd -m -u 1000 runner \
     && mkdir -p /app/data \
     && chown -R runner:runner /app
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chown=runner:runner docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+USER 1000:1000
 VOLUME ["/app/data"]
 
-# The entrypoint does the root-only setup then drops to `runner` and execs the
-# command. Args after the image name are passed to scrape.py, e.g.
-# `docker run sc-scraper --daily`. The scheduler service reuses this same
-# entrypoint but overrides the command with schedule.sh (see docker-compose.yml).
+# Entrypoint runs as the unprivileged user and execs the command. Args after
+# the image name are passed to scrape.py, e.g. `docker run sc-scraper --daily`.
+# The scheduler service reuses this same entrypoint but overrides the command
+# with schedule.sh (see docker-compose.yml).
 ENTRYPOINT ["docker-entrypoint.sh", "python", "scrape.py"]
 CMD ["--help"]
