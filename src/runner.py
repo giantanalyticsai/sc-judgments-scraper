@@ -111,6 +111,47 @@ def _merge_failures(
     return list(merged.values())
 
 
+def _reconcile_retries(
+    active: List[dict],
+    attempted_failures: List[Tuple[dict, str]],
+    succeeded_paths: Set[str],
+    transient_run: bool,
+) -> Tuple[List[dict], int]:
+    """Compute the updated active-failure list after a --retry-failures run.
+
+    Untouched entries (not attempted, e.g. beyond a throttle-abort point) pass
+    through unchanged. For attempted-and-failed entries:
+      * a genuine per-document failure (http_<status> / no_outputfile / error)
+        always advances retry_count and may cross into `stale`;
+      * an `empty_pdf` (the portal's throttle signal) advances retry_count ONLY
+        when the run completed normally. If the run was throttle-aborted or
+        portal-down (`transient_run`), the empties reflect a site-wide transient
+        condition, not a bad document, so they are left unchanged — this is what
+        stops sustained throttling from parking good docs as stale.
+
+    Returns (updated_active_entries, newly_stale_count).
+    """
+    attempted_paths = {e["path"] for e, _ in attempted_failures} | succeeded_paths
+    result = [e for e in active if e["path"] not in attempted_paths]
+    newly_stale = 0
+    for entry, reason in attempted_failures:
+        if reason == "empty_pdf" and transient_run:
+            result.append(entry)  # transient throttle/outage — do not penalise
+            continue
+        entry["retry_count"] += 1
+        entry["failed_at"] = datetime.now().isoformat()
+        entry["reason"] = reason
+        if entry["retry_count"] >= config.STALE_RETRY_THRESHOLD:
+            entry["status"] = "stale"
+            newly_stale += 1
+            logger.warning(
+                "Marking %s stale after %d failed retries — manual review needed",
+                entry["path"], entry["retry_count"],
+            )
+        result.append(entry)
+    return result, newly_stale
+
+
 def _throttle_recovery(
     downloader: Downloader, record: JudgmentRecord, streak: int
 ) -> Tuple[Optional[bytes], Optional[str]]:
@@ -278,25 +319,14 @@ def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
     downloader = Downloader(session)
     consecutive_empty = 0
     downloads_since_reset = 0
-    still_failing: List[dict] = []
     succeeded_paths: Set[str] = set()
-
-    def _record_failure(entry: dict, reason: Optional[str]) -> None:
-        entry["retry_count"] += 1
-        entry["failed_at"] = datetime.now().isoformat()
-        if reason:
-            entry["reason"] = reason
-        if entry["retry_count"] >= config.STALE_RETRY_THRESHOLD:
-            entry["status"] = "stale"
-            stats.stale += 1
-            logger.warning(
-                "Marking %s stale after %d failed retries — manual review needed",
-                entry["path"], entry["retry_count"],
-            )
-        still_failing.append(entry)
+    # (entry, reason) per doc attempted-and-failed this run. Accounting is
+    # deferred to the finally block (see _reconcile_retries) so empties from a
+    # throttle-aborted / portal-down run don't advance the stale counter.
+    attempted_failures: List[Tuple[dict, str]] = []
 
     try:
-        for index, entry in enumerate(active):
+        for entry in active:
             record = JudgmentRecord(
                 path=entry["path"],
                 val=entry["val"],
@@ -336,13 +366,10 @@ def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
                 consecutive_empty = 0
             else:
                 stats.failed += 1
-                _record_failure(entry, reason)
+                attempted_failures.append((entry, reason or "unknown"))
                 if is_throttle_signal:
                     consecutive_empty += 1
                     if consecutive_empty >= config.CONSECUTIVE_EMPTY_THRESHOLD:
-                        # Keep the records we haven't reached yet in the file
-                        # too, untouched (they weren't attempted).
-                        still_failing.extend(active[index + 1:])
                         raise ThrottleError(consecutive_empty)
                 else:
                     consecutive_empty = 0
@@ -353,12 +380,15 @@ def retry_failures(output_dir: Path, delay: Optional[float] = None) -> Stats:
         stats.site_down = True
         logger.error("Portal unreachable mid-run (connection/5xx): %s", exc)
     finally:
-        if stats.site_down:
-            # A dead portal says nothing about individual records: put every
-            # unresolved entry back unchanged (no retry_count increment).
-            handled = {e["path"] for e in still_failing} | succeeded_paths
-            still_failing.extend(e for e in active if e["path"] not in handled)
-        storage.save_failures(stale + still_failing)
+        # Entries not attempted this run pass through unchanged; genuine
+        # per-doc failures advance toward stale; empties from a throttle-aborted
+        # or portal-down run are transient and are left unchanged.
+        result, newly_stale = _reconcile_retries(
+            active, attempted_failures, succeeded_paths,
+            transient_run=stats.aborted or stats.site_down,
+        )
+        stats.stale += newly_stale
+        storage.save_failures(stale + result)
 
     _log_outcome(stats, storage)
     return stats

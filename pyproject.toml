@@ -1,6 +1,6 @@
 [project]
 name = "sc-judgments-scraper"
-version = "0.3.1"
+version = "0.3.2"
 description = "Local, date-range-driven scraper for Indian Supreme Court judgments (scr.sci.gov.in)"
 requires-python = ">=3.9"
 dependencies = [
